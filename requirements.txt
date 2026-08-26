@@ -1,0 +1,8 @@
+streamlit
+pandas
+numpy
+requests
+beautifulsoup4
+html5lib
+lxml
+openai>=1.0.0
