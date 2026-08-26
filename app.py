@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 import os
+import time
 
 import pandas as pd
 import streamlit as st
@@ -28,7 +29,6 @@ def load_settings():
         secrets = st.secrets
     except Exception:
         secrets = {}
-
     for canonical, aliases in SECRET_ALIASES.items():
         value = None
         for name in aliases:
@@ -104,11 +104,36 @@ def fmt_pct(value):
         return "-"
 
 
+@st.cache_data(ttl=7 * 24 * 3600, show_spinner=False)
+def cached_corp_codes(api_key: str) -> pd.DataFrame:
+    """Cache only the DART corporation master list.
+
+    data_sources.py is intentionally untouched. We populate the client's
+    existing in-memory cache with this DataFrame so resolve_company() does not
+    re-download corpCode.xml on every Streamlit rerun.
+    """
+    client = OpenDARTClient(api_key)
+    return client.corp_codes().copy()
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def cached_company_bundle(api_key: str, company: str, year: int):
+    """Cache DART company lookup + financials + filings + company info."""
+    client = OpenDARTClient(api_key)
+    client._corp_codes = cached_corp_codes(api_key).copy()
+    corp = client.resolve_company(company.strip())
+    if not corp:
+        raise RuntimeError(f"OpenDART에서 기업을 찾지 못했습니다: {company}")
+    financials = client.get_financials(corp["corp_code"], year=year)
+    notices = client.search_filings(corp["corp_code"], bgn_de=date(year, 1, 1), end_de=date.today())
+    company_info = client.get_company_info(corp["corp_code"])
+    return corp, financials, notices, company_info
+
+
 st.set_page_config(page_title="기업 분석 Engine", page_icon="📈", layout="wide")
 st.title("📈 기업 분석 Engine")
 st.caption("Step 1 Feature Engine → Step 2 Valuation Engine")
 
-# Step indicator
 s1, s2, s3, s4 = st.columns(4)
 s1.markdown("### 🟢 1. Feature Engine")
 s2.markdown("### 🔵 2. Valuation Engine")
@@ -120,9 +145,11 @@ with st.sidebar:
     st.header("API 설정")
     dart_key = st.text_input("OpenDART API Key", value=settings.get("OPENDART_API_KEY", ""), type="password")
     ecos_key = settings.get("ECOS_API_KEY", "")
+    openai_key = settings.get("OPENAI_API_KEY", "")
     st.write(f"OpenDART: {'감지됨' if dart_key else '없음'}")
     st.write(f"ECOS: {'감지됨' if ecos_key else '없음'}")
-    st.info("현재 Step 1~2에서는 GPT를 호출하지 않습니다.")
+    st.write(f"OpenAI/GPT: {'감지됨' if openai_key else '없음'}")
+    st.info("Step 1~2 계산에는 GPT를 사용하지 않습니다.")
 
 company = st.text_input("분석할 기업명", placeholder="예: 삼성전자", key="company_input")
 year = st.number_input(
@@ -146,18 +173,24 @@ if run_feature:
 
     try:
         with st.status("Step 1 데이터 수집 및 Feature 계산 중...", expanded=True) as status:
-            dart = OpenDARTClient(dart_key)
-            corp = dart.resolve_company(company.strip())
-            if not corp:
-                status.update(label="기업을 찾지 못했습니다.", state="error")
-                st.error("OpenDART에서 기업을 찾지 못했습니다.")
-                st.stop()
-            status.write("✓ OpenDART 기업코드 확인")
+            corp = financials = notices = company_info = None
+            last_error = None
+            for attempt in range(3):
+                try:
+                    corp, financials, notices, company_info = cached_company_bundle(
+                        dart_key, company.strip(), int(year)
+                    )
+                    last_error = None
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    if attempt < 2:
+                        status.write(f"⚠ OpenDART 연결 재시도 {attempt + 1}/2")
+                        time.sleep(1.0)
+            if last_error is not None:
+                raise last_error
 
-            financials = dart.get_financials(corp["corp_code"], year=year)
-            notices = dart.search_filings(corp["corp_code"], bgn_de=date(year, 1, 1), end_de=date.today())
-            company_info = dart.get_company_info(corp["corp_code"])
-            status.write("✓ DART 재무/공시 수집")
+            status.write("✓ OpenDART 기업/재무/공시 수집")
 
             market = None
             market_error = None
@@ -208,7 +241,6 @@ if run_feature:
         st.error(f"Feature Engine 실행 중 오류가 발생했습니다: {exc}")
         st.exception(exc)
 
-# Step 1 results persist across Streamlit reruns.
 if st.session_state.get("analysis_ready"):
     features = st.session_state["features"]
     market = st.session_state.get("market") or {}
@@ -292,7 +324,6 @@ if st.session_state.get("analysis_ready"):
     if st.session_state.get("valuation"):
         valuation = st.session_state["valuation"]
         st.success("Step 2 Valuation Engine 완료")
-
         vc = st.columns(5)
         vc[0].metric("현재가", fmt_money(valuation["inputs"].get("current_price")))
         vc[1].metric("종합 적정가", fmt_money(valuation.get("fair_value_per_share")))
