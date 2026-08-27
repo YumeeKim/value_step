@@ -139,7 +139,7 @@ if "valuation" not in st.session_state:
 
 c1, c2, c3 = st.columns(3)
 run_feature = c1.button("① Feature Engine 실행", type="primary", use_container_width=True)
-go_valuation = c2.button("② Valuation Engine", use_container_width=True, disabled=st.session_state.research is None)
+go_valuation = c2.button("② Valuation Engine", use_container_width=True)
 reset = c3.button("초기화", use_container_width=True)
 
 if reset:
@@ -165,6 +165,9 @@ if run_feature:
             st.code(traceback.format_exc())
 
 research = st.session_state.research
+if go_valuation and research is None:
+    st.warning("먼저 ① Feature Engine을 실행해 주세요.")
+
 if research:
     if research.get("market_msg"):
         st.warning(research["market_msg"])
